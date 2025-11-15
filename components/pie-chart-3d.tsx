@@ -42,14 +42,14 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
     container.appendChild(renderer.domElement)
     rendererRef.current = renderer
 
-    const group = new THREE.Group()
-    groupRef.current = group
-    scene.add(group)
+  const group = new THREE.Group()
+  groupRef.current = group
+  scene.add(group)
 
   // Raycaster and mouse for hover interaction
   const raycaster = new THREE.Raycaster()
   const mouse = new THREE.Vector2()
-  const meshes: THREE.Mesh[] = []
+  const meshes: Array<THREE.Object3D> = []
   const hoveredRef = { index: -1 }
 
   // Label info will store DOM elements and the 3D anchor points we use for projection
@@ -63,9 +63,10 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         line: THREE.Line
         // the 2D projected end point used for label placement (updated each frame)
         endPoint: THREE.Vector3
-        // horizontal offset distance for the outward label
-        offset?: number
-        arrow?: THREE.ArrowHelper
+    // horizontal offset distance for the outward label
+    offset?: number
+    pointer?: THREE.Mesh
+    sliceGroup?: THREE.Object3D
         side: 'left' | 'right'
       }[] = []
 
@@ -130,7 +131,7 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       if (item.value === 0) return
 
       const sliceAngle = (item.value / total) * Math.PI * 2
-  const geometry = new THREE.BufferGeometry()
+  let geometry = new THREE.BufferGeometry()
 
   const vertices: number[] = []
   const uvs: number[] = []
@@ -177,24 +178,29 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       }
 
       // Side faces (curved edges)
-      for (let i = 0; i <= segmentResolution; i++) {
+      // Use consistent winding so normals point outward
+      for (let i = 0; i < segmentResolution; i++) {
         const current = frontFaceStart + i
-        const next = frontFaceStart + ((i + 1) % (segmentResolution + 1))
+  const next = frontFaceStart + i + 1
         const backCurrent = backFaceStart + i
-        const backNext = backFaceStart + ((i + 1) % (segmentResolution + 1))
+  const backNext = backFaceStart + i + 1
 
-        indices.push(current, backCurrent, backNext)
-        indices.push(current, backNext, next)
+        // two triangles for the quad between front/current and back/current
+        indices.push(current, next, backNext)
+        indices.push(current, backNext, backCurrent)
       }
 
-      geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3))
+  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3))
   geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2))
       geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1))
-      geometry.computeVertexNormals()
+  // Convert to non-indexed so faces don't share vertices; this gives clean
+  // flat normals for the inner walls and prevents smoothing artifacts.
+  geometry = geometry.toNonIndexed()
+  geometry.computeVertexNormals()
 
       // Create a non-reflective, matte material using a subtle canvas-based texture.
       const texture = createCanvasTextureFromHex(item.color)
-      const material = new THREE.MeshStandardMaterial({
+  const material = new THREE.MeshStandardMaterial({
         // use the texture as the base visual; the color should be neutral (white) so the
         // texture provides the color itself. We set metalness to 0 and roughness to 1
         // for a non-reflective result.
@@ -202,23 +208,92 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         color: 0xffffff,
         metalness: 0,
         roughness: 1,
+        // show both sides so the slice inner walls are visible when the mesh is moved
+  side: THREE.DoubleSide,
+  flatShading: true,
         emissive: 0x000000,
         emissiveIntensity: 0,
       })
+      // reduce z-fighting with labels and lines by slightly offsetting polygon depth
+      material.polygonOffset = true
+      material.polygonOffsetFactor = -1
+      material.polygonOffsetUnits = -1
+  // mark material for update to apply flat shading
+  material.needsUpdate = true
 
-      const mesh = new THREE.Mesh(geometry, material)
-      mesh.castShadow = true
-      mesh.receiveShadow = true
-  group.add(mesh)
+        // Build two meshes: caps (front/back) and the side (rim). We'll put both into a sliceGroup
+  // We'll construct cap+side indices in separate arrays below
+
+        // Separate indices into front/back (capIndices) and sides (sideIndices)
+        const capIndices: number[] = []
+        const sideIndices: number[] = []
+        // Iterate again to fill caps and sides
+        // Front face triangles
+        for (let i = 0; i < segmentResolution; i++) {
+          capIndices.push(frontFaceStart + i, frontFaceStart + i + 1, frontCenter)
+        }
+        // Back face triangles
+        for (let i = 0; i < segmentResolution; i++) {
+          capIndices.push(backFaceStart + i + 1, backFaceStart + i, backCenter)
+        }
+        // Side faces
+        for (let i = 0; i < segmentResolution; i++) {
+          const current = frontFaceStart + i
+          const next = frontFaceStart + i + 1
+          const backCurrent = backFaceStart + i
+          const backNext = backFaceStart + i + 1
+          sideIndices.push(current, next, backNext)
+          sideIndices.push(current, backNext, backCurrent)
+        }
+
+    let capGeom = new THREE.BufferGeometry()
+        capGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3))
+        capGeom.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2))
+        capGeom.setIndex(new THREE.BufferAttribute(new Uint32Array(capIndices), 1))
+    let sideGeom = new THREE.BufferGeometry()
+        sideGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3))
+        sideGeom.setIndex(new THREE.BufferAttribute(new Uint32Array(sideIndices), 1))
+
+        // Convert to non-indexed to get flat faces
+        capGeom = capGeom.toNonIndexed() as THREE.BufferGeometry
+        sideGeom = sideGeom.toNonIndexed() as THREE.BufferGeometry
+        capGeom.computeVertexNormals()
+        sideGeom.computeVertexNormals()
+
+        const capMesh = new THREE.Mesh(capGeom, material)
+        capMesh.castShadow = true
+        capMesh.receiveShadow = true
+
+        // Side material slightly darker
+        const sideMaterial = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(item.color).multiplyScalar(0.82),
+          metalness: 0,
+          roughness: 1,
+          side: THREE.DoubleSide,
+          flatShading: true,
+        })
+        sideMaterial.polygonOffset = true
+        sideMaterial.polygonOffsetFactor = -1
+        sideMaterial.polygonOffsetUnits = -1
+
+        const sideMesh = new THREE.Mesh(sideGeom, sideMaterial)
+        sideMesh.castShadow = true
+        sideMesh.receiveShadow = true
+
+        const sliceGroup = new THREE.Group()
+        sliceGroup.add(capMesh)
+        sliceGroup.add(sideMesh)
+        group.add(sliceGroup)
   
 
-      // --- Leader line + label ---
+  // --- Leader line + label ---
   const midAngle = startAngle + sliceAngle / 2
   // store index and radial direction on mesh for interaction and keep a list
-  mesh.userData.sliceIndex = idx
-  mesh.userData.midAngle = midAngle
-  mesh.userData.radialDir = new THREE.Vector3(Math.cos(midAngle), Math.sin(midAngle), 0)
-  meshes.push(mesh)
+    sliceGroup.userData.sliceIndex = idx
+    sliceGroup.userData.midAngle = midAngle
+    sliceGroup.userData.radialDir = new THREE.Vector3(Math.cos(midAngle), Math.sin(midAngle), 0)
+    // this 'meshes' array stores the root group for raycasting; intersectObjects will check children
+  meshes.push(sliceGroup)
 
       // radial start from outer rim
   const rimPoint = new THREE.Vector3(Math.cos(midAngle) * radius, Math.sin(midAngle) * radius, depth / 2)
@@ -236,16 +311,28 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       )
 
   const points = [rimPoint, radialOut, horizontalEnd]
+      // darken backfaces (inner walls) so they read as depth; we tweak this in shader
+      material.onBeforeCompile = (shader) => {
+        // make inside faces ~60% brightness of front faces
+        shader.fragmentShader = shader.fragmentShader.replace(
+          'vec4 diffuseColor = vec4( diffuse, opacity );',
+          'vec4 diffuseColor = vec4( diffuse, opacity );\n    if ( !gl_FrontFacing ) diffuseColor.rgb *= 0.6;'
+        )
+      }
       const lineGeometry = new THREE.BufferGeometry().setFromPoints(points)
       const lineMaterial = new THREE.LineBasicMaterial({ color: 0x0f172a, linewidth: 2 })
-      const line = new THREE.Line(lineGeometry, lineMaterial)
+  const line = new THREE.Line(lineGeometry, lineMaterial)
       line.renderOrder = 999
-  group.add(line)
+  // add line to sliceGroup so it moves when popped out
+  sliceGroup.add(line)
   // Add a small pulsing arrow at the horizontal end (initially hidden)
-  const arrowDir = new THREE.Vector3(Math.cos(midAngle), Math.sin(midAngle), 0).normalize()
-  const arrow = new THREE.ArrowHelper(arrowDir, horizontalEnd, 0.36, item.color, 0.08, 0.04)
-  arrow.visible = false
-  group.add(arrow)
+  // Create a small spherical pointer at the end of the line; this pulses when hovered.
+  const sphereGeo = new THREE.SphereGeometry(0.06, 8, 8)
+  const sphereMat = new THREE.MeshBasicMaterial({ color: item.color })
+  const pointer = new THREE.Mesh(sphereGeo, sphereMat)
+  pointer.position.copy(horizontalEnd)
+  pointer.visible = false
+  sliceGroup.add(pointer)
 
       // Create DOM label
       const labelEl = document.createElement('div')
@@ -266,7 +353,8 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       container.appendChild(labelEl)
 
   // Save radialOut in local-space for future recomputation and the line to update
-  labelInfos.push({ el: labelEl, radialOutLocal: radialOut, line, endPoint: horizontalEnd, rimPointLocal: rimPoint, offset: horizontalOffset, side: toRight ? 'right' : 'left', arrow })
+  // Store link to the slice group as well so we can project local points
+  labelInfos.push({ el: labelEl, radialOutLocal: radialOut, line, endPoint: horizontalEnd, rimPointLocal: rimPoint, offset: horizontalOffset, side: toRight ? 'right' : 'left', pointer, sliceGroup })
 
       startAngle += sliceAngle
     })
@@ -351,23 +439,31 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       // check hover state (raycast based on mouse) so we can animate hovered slice
       raycaster.setFromCamera(mouse, camera)
       const intersects = raycaster.intersectObjects(meshes, true)
-      const hoveredIndex = intersects.length > 0 ? (intersects[0].object as any).userData.sliceIndex : -1
+      let hoveredIndex = -1
+      if (intersects.length > 0) {
+        // find the top-most ancestor that is in the meshes list (sliceGroup)
+        let obj: THREE.Object3D | null = intersects[0].object
+        while (obj && !meshes.includes(obj)) {
+          obj = obj.parent
+        }
+        hoveredIndex = obj && obj.userData ? obj.userData.sliceIndex ?? -1 : -1
+      }
       if (hoveredRef.index !== hoveredIndex) {
         hoveredRef.index = hoveredIndex
         labelInfos.forEach((li, idx) => {
-          if (li.arrow) li.arrow.visible = idx === hoveredIndex
+    if (li.pointer) li.pointer.visible = idx === hoveredIndex
         })
       }
 
       // update label positions by projecting 3D point into 2D
       const canvas = renderer.domElement
-      labelInfos.forEach((li, i) => {
+  labelInfos.forEach((li, i) => {
   // Lines are fixed with the pie in local coordinates so they rotate together.
   // We just need to project the local horizontal endpoint into screen space for label placement.
-  const group = groupRef.current!
-  group.updateMatrixWorld(true)
+  const sliceG = li.sliceGroup ?? groupRef.current!
+  sliceG.updateMatrixWorld(true)
 
-  const horizontalWorld = li.endPoint.clone().applyMatrix4(group.matrixWorld)
+  const horizontalWorld = li.endPoint.clone().applyMatrix4(sliceG.matrixWorld)
   const pos = horizontalWorld.clone().project(camera)
         const x = (pos.x * 0.5 + 0.5) * canvas.clientWidth
         const y = (-pos.y * 0.5 + 0.5) * canvas.clientHeight
@@ -389,21 +485,34 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         }
 
         // Hover animation: push the mesh a bit outward along its radial direction and pulse arrow
-        const mesh = meshes[i]
-        const radialDir = mesh?.userData?.radialDir as THREE.Vector3 | undefined
+  // meshes[] now contains sliceGroup objects; use that group as the moving part
+  const groupSlice = meshes[i] as THREE.Group | undefined
+  const radialDir = groupSlice?.userData?.radialDir as THREE.Vector3 | undefined
         const isHover = hoveredRef.index === i
         const targetPos = new THREE.Vector3(0, 0, 0)
         if (isHover && radialDir) {
           targetPos.copy(radialDir).multiplyScalar(0.15)
         }
-        if (mesh) mesh.position.lerp(targetPos, 0.12)
+  if (groupSlice) groupSlice.position.lerp(targetPos, 0.12)
 
-        if (li.arrow) {
-          if (li.arrow.visible) {
-            const pulse = 0.02 * Math.sin(Date.now() * 0.01 * 12)
-            const baseLen = 0.36
-            li.arrow.setLength(baseLen + pulse, 0.08 + pulse * 0.2, 0.04 + pulse * 0.4)
+        // line and pointer are attached to the sliceGroup so they stay stable with group movement
+
+        if (li.pointer) {
+          if (li.pointer.visible) {
+            const pulse = 0.12 + 0.06 * Math.sin(Date.now() * 0.01 * 12)
+            li.pointer.scale.setScalar(pulse)
+          } else {
+            li.pointer.scale.setScalar(1)
           }
+        }
+
+        // Update line & pointer to follow the local ends of the slice group
+        if (groupSlice) {
+          const movedRim = li.rimPointLocal!.clone().add(groupSlice.position)
+          const movedRadial = li.radialOutLocal.clone().add(groupSlice.position)
+          const movedEnd = li.endPoint.clone().add(groupSlice.position)
+          li.line.geometry.setFromPoints([movedRim, movedRadial, movedEnd])
+          if (li.pointer) li.pointer.position.copy(movedEnd)
         }
       })
 
@@ -444,13 +553,9 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       // remove any DOM labels created
       labelInfos.forEach((li) => {
         if (container.contains(li.el)) container.removeChild(li.el)
-        // remove the THREE line if it's still attached
-        if (groupRef.current && li.line && groupRef.current.children.includes(li.line)) {
-          groupRef.current.remove(li.line)
-        }
-        // remove arrow if present
-        if (groupRef.current && li.arrow && groupRef.current.children.includes(li.arrow)) {
-          groupRef.current.remove(li.arrow)
+        // remove the slice group (line/pointer are children of it) if present
+        if (li.sliceGroup && li.sliceGroup.parent) {
+          li.sliceGroup.parent.remove(li.sliceGroup)
         }
       })
     }
