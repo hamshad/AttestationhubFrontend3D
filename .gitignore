@@ -1,0 +1,50 @@
+# Dependencies
+/node_modules
+.pnp
+.pnp.js
+
+# Testing
+/coverage
+
+# Next.js build output
+.next/
+/out/
+
+# Production build output (if different from .next)
+/build/
+
+# Miscellaneous
+.DS_Store
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env*.local
+.env
+.next/cache/
+.next/standalone/
+.next/static/
+.next/trace/
+.next/types/
+.next/server/
+.next/analyze/
+.next/export/
+.next/required-server-files.json
+
+# Editor-specific files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Next.js specific files that might be generated
+next-env.d.ts # This file is usually tracked, but if you have specific reasons to ignore, add it.
+
+# Optional: If you're using a specific database or backend, add their ignore patterns here
+# For example, if you have a local SQLite database:
+# *.sqlite
+# *.db
+
+# Optional: If you're using a specific CI/CD tool, add its ignore patterns here
+# For example, for Vercel deployment:
+# .vercel/
