@@ -44,6 +44,22 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
     groupRef.current = group
     scene.add(group)
 
+      // Label info will store DOM elements and the 3D anchor points we use for projection
+      const labelInfos: {
+        el: HTMLDivElement
+        // radial out point in local space (unchanged after creation)
+        radialOutLocal: THREE.Vector3
+        // rim point in local space (outer boundary)
+        rimPointLocal?: THREE.Vector3
+        // line object we update each frame
+        line: THREE.Line
+        // the 2D projected end point used for label placement (updated each frame)
+        endPoint: THREE.Vector3
+        // horizontal offset distance for the outward label
+        offset?: number
+        side: 'left' | 'right'
+      }[] = []
+
     const total = completed + pending + autoClosed
     if (total === 0) return
 
@@ -58,27 +74,71 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
     const depth = 0.3
     const segmentResolution = 256
 
+    // Helper to create a subtle, non-reflective texture from a color.
+    function createCanvasTextureFromHex(hexColor: number) {
+      const canvas = document.createElement('canvas')
+      const size = 128
+      canvas.width = size
+      canvas.height = size
+      const ctx = canvas.getContext('2d')!
+
+      // Fill with base color
+      const hex = hexColor.toString(16).padStart(6, '0')
+      ctx.fillStyle = `#${hex}`
+      ctx.fillRect(0, 0, size, size)
+
+      // Add a soft paper-like noise to make it look textured and non-reflective
+      ctx.globalAlpha = 0.07
+      ctx.fillStyle = '#ffffff'
+      for (let i = 0; i < 5000; i++) {
+        ctx.fillRect(Math.random() * size, Math.random() * size, 1, 1)
+      }
+
+      // Add a fine crosshatch overlay for subtle detail
+      ctx.globalAlpha = 0.04
+      ctx.strokeStyle = '#000000'
+      for (let i = 0; i < 25; i++) {
+        const pos = (i / 25) * size
+        ctx.beginPath()
+        ctx.moveTo(pos, 0)
+        ctx.lineTo(0, pos)
+        ctx.stroke()
+        ctx.beginPath()
+        ctx.moveTo(size - pos, 0)
+        ctx.lineTo(size, pos)
+        ctx.stroke()
+      }
+
+      const texture = new THREE.CanvasTexture(canvas)
+      texture.wrapS = THREE.RepeatWrapping
+      texture.wrapT = THREE.RepeatWrapping
+      texture.repeat.set(1, 1)
+      return texture
+    }
+
     data.forEach((item) => {
       if (item.value === 0) return
 
       const sliceAngle = (item.value / total) * Math.PI * 2
-      const geometry = new THREE.BufferGeometry()
+  const geometry = new THREE.BufferGeometry()
 
-      const vertices: number[] = []
-      const indices: Uint32Array | number[] = []
+  const vertices: number[] = []
+  const uvs: number[] = []
+  const indices: Uint32Array | number[] = []
       let vertexIndex = 0
 
       // Create front face (z = depth)
       const frontFaceStart = vertexIndex
       for (let i = 0; i <= segmentResolution; i++) {
         const angle = startAngle + (i / segmentResolution) * sliceAngle
-        vertices.push(
-          Math.cos(angle) * radius,
-          Math.sin(angle) * radius,
-          depth
-        )
+        const vx = Math.cos(angle) * radius
+        const vy = Math.sin(angle) * radius
+        vertices.push(vx, vy, depth)
+        // Basic planar UV mapping based on XY coordinates
+        uvs.push(vx / (radius * 2) + 0.5, vy / (radius * 2) + 0.5)
       }
       vertices.push(0, 0, depth)
+      uvs.push(0.5, 0.5)
       const frontCenter = vertexIndex + segmentResolution + 1
       vertexIndex += segmentResolution + 2
 
@@ -86,13 +146,13 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       const backFaceStart = vertexIndex
       for (let i = 0; i <= segmentResolution; i++) {
         const angle = startAngle + (i / segmentResolution) * sliceAngle
-        vertices.push(
-          Math.cos(angle) * radius,
-          Math.sin(angle) * radius,
-          0
-        )
+        const vx = Math.cos(angle) * radius
+        const vy = Math.sin(angle) * radius
+        vertices.push(vx, vy, 0)
+        uvs.push(vx / (radius * 2) + 0.5, vy / (radius * 2) + 0.5)
       }
       vertices.push(0, 0, 0)
+      uvs.push(0.5, 0.5)
       const backCenter = vertexIndex + segmentResolution + 1
       vertexIndex += segmentResolution + 2
 
@@ -118,21 +178,74 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       }
 
       geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertices), 3))
+  geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs), 2))
       geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1))
       geometry.computeVertexNormals()
 
+      // Create a non-reflective, matte material using a subtle canvas-based texture.
+      const texture = createCanvasTextureFromHex(item.color)
       const material = new THREE.MeshStandardMaterial({
-        color: item.color,
-        metalness: 0.4,
-        roughness: 0.3,
-        emissive: item.color,
-        emissiveIntensity: 0.1,
+        // use the texture as the base visual; the color should be neutral (white) so the
+        // texture provides the color itself. We set metalness to 0 and roughness to 1
+        // for a non-reflective result.
+        map: texture,
+        color: 0xffffff,
+        metalness: 0,
+        roughness: 1,
+        emissive: 0x000000,
+        emissiveIntensity: 0,
       })
 
       const mesh = new THREE.Mesh(geometry, material)
       mesh.castShadow = true
       mesh.receiveShadow = true
       group.add(mesh)
+
+      // --- Leader line + label ---
+      const midAngle = startAngle + sliceAngle / 2
+
+      // radial start from outer rim
+  const rimPoint = new THREE.Vector3(Math.cos(midAngle) * radius, Math.sin(midAngle) * radius, depth / 2)
+      const radialOut = new THREE.Vector3(Math.cos(midAngle) * (radius + 0.2), Math.sin(midAngle) * (radius + 0.2), depth / 2)
+
+      // horizontal endpoint to left or right
+      const horizontalOffset = 0.6
+  // Decide whether the label should be placed to the right or left of the section.
+  // Use strict > 0 so top/bottom (cos===0) consistently choose the left side.
+  const toRight = Math.cos(midAngle) > 0
+      const horizontalEnd = new THREE.Vector3(
+        radialOut.x + (toRight ? horizontalOffset : -horizontalOffset),
+        radialOut.y,
+        radialOut.z
+      )
+
+      const points = [rimPoint, radialOut, horizontalEnd]
+      const lineGeometry = new THREE.BufferGeometry().setFromPoints(points)
+      const lineMaterial = new THREE.LineBasicMaterial({ color: 0x0f172a, linewidth: 2 })
+      const line = new THREE.Line(lineGeometry, lineMaterial)
+      line.renderOrder = 999
+      group.add(line)
+
+      // Create DOM label
+      const labelEl = document.createElement('div')
+      labelEl.style.position = 'absolute'
+      labelEl.style.pointerEvents = 'none'
+  labelEl.style.fontWeight = '700'
+  labelEl.style.fontSize = '20px'
+  labelEl.style.padding = '4px 8px'
+  labelEl.style.background = 'rgba(255,255,255,0.9)'
+  labelEl.style.borderRadius = '6px'
+      labelEl.style.color = '#003149'
+      labelEl.style.whiteSpace = 'nowrap'
+      labelEl.style.transform = `translate(-50%, -50%)`
+  labelEl.style.textShadow = '0 1px 0 rgba(255,255,255,0.6)'
+  labelEl.style.boxShadow = '0 2px 8px rgba(0,0,0,0.08)'
+      const percent = Math.round((item.value / total) * 100)
+      labelEl.textContent = `${percent}%`
+      container.appendChild(labelEl)
+
+  // Save radialOut in local-space for future recomputation and the line to update
+  labelInfos.push({ el: labelEl, radialOutLocal: radialOut, line, endPoint: horizontalEnd, rimPointLocal: rimPoint, offset: horizontalOffset, side: toRight ? 'right' : 'left' })
 
       startAngle += sliceAngle
     })
@@ -210,6 +323,36 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         groupRef.current.rotation.z = rotationRef.current.z
       }
 
+      // update label positions by projecting 3D point into 2D
+      const canvas = renderer.domElement
+      labelInfos.forEach((li) => {
+  // Lines are fixed with the pie in local coordinates so they rotate together.
+  // We just need to project the local horizontal endpoint into screen space for label placement.
+  const group = groupRef.current!
+  group.updateMatrixWorld(true)
+
+  const horizontalWorld = li.endPoint.clone().applyMatrix4(group.matrixWorld)
+  const pos = horizontalWorld.clone().project(camera)
+        const x = (pos.x * 0.5 + 0.5) * canvas.clientWidth
+        const y = (-pos.y * 0.5 + 0.5) * canvas.clientHeight
+
+  // hide if behind camera
+  const isVisible = pos.z < 1 && pos.z > -1
+        li.el.style.visibility = isVisible ? 'visible' : 'hidden'
+
+  if (li.side === 'right') {
+          li.el.style.left = `${x + 8}px`
+          li.el.style.top = `${y}px`
+          li.el.style.transform = 'translate(0%, -50%)'
+          li.el.style.textAlign = 'left'
+        } else {
+          li.el.style.left = `${x - 8}px`
+          li.el.style.top = `${y}px`
+          li.el.style.transform = 'translate(-100%, -50%)'
+          li.el.style.textAlign = 'right'
+        }
+      })
+
       renderer.render(scene, camera)
     }
 
@@ -244,6 +387,14 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       if (container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement)
       }
+      // remove any DOM labels created
+      labelInfos.forEach((li) => {
+        if (container.contains(li.el)) container.removeChild(li.el)
+        // remove the THREE line if it's still attached
+        if (groupRef.current && li.line && groupRef.current.children.includes(li.line)) {
+          groupRef.current.remove(li.line)
+        }
+      })
     }
   }, [completed, pending, autoClosed])
 
