@@ -9,6 +9,7 @@ interface PieChart3DProps {
   autoClosed: number
 }
 
+    
 export default function PieChart3D({ completed, pending, autoClosed }: PieChart3DProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const sceneRef = useRef<THREE.Scene | null>(null)
@@ -22,6 +23,7 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
     if (!containerRef.current) return
 
     const container = containerRef.current
+    
     const width = container.clientWidth || 400
     const height = container.clientHeight || 300
 
@@ -44,7 +46,13 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
     groupRef.current = group
     scene.add(group)
 
-      // Label info will store DOM elements and the 3D anchor points we use for projection
+  // Raycaster and mouse for hover interaction
+  const raycaster = new THREE.Raycaster()
+  const mouse = new THREE.Vector2()
+  const meshes: THREE.Mesh[] = []
+  const hoveredRef = { index: -1 }
+
+  // Label info will store DOM elements and the 3D anchor points we use for projection
       const labelInfos: {
         el: HTMLDivElement
         // radial out point in local space (unchanged after creation)
@@ -57,13 +65,15 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         endPoint: THREE.Vector3
         // horizontal offset distance for the outward label
         offset?: number
+        arrow?: THREE.ArrowHelper
         side: 'left' | 'right'
       }[] = []
 
     const total = completed + pending + autoClosed
     if (total === 0) return
 
-    const data = [
+      
+  const data = [
       { value: completed, color: 0x10b981, label: 'Completed' },
       { value: pending, color: 0x003149, label: 'Pending' },
       { value: autoClosed, color: 0xf59e0b, label: 'Auto Closed' },
@@ -116,7 +126,7 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       return texture
     }
 
-    data.forEach((item) => {
+  data.forEach((item, idx) => {
       if (item.value === 0) return
 
       const sliceAngle = (item.value / total) * Math.PI * 2
@@ -199,10 +209,16 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       const mesh = new THREE.Mesh(geometry, material)
       mesh.castShadow = true
       mesh.receiveShadow = true
-      group.add(mesh)
+  group.add(mesh)
+  
 
       // --- Leader line + label ---
-      const midAngle = startAngle + sliceAngle / 2
+  const midAngle = startAngle + sliceAngle / 2
+  // store index and radial direction on mesh for interaction and keep a list
+  mesh.userData.sliceIndex = idx
+  mesh.userData.midAngle = midAngle
+  mesh.userData.radialDir = new THREE.Vector3(Math.cos(midAngle), Math.sin(midAngle), 0)
+  meshes.push(mesh)
 
       // radial start from outer rim
   const rimPoint = new THREE.Vector3(Math.cos(midAngle) * radius, Math.sin(midAngle) * radius, depth / 2)
@@ -219,12 +235,17 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         radialOut.z
       )
 
-      const points = [rimPoint, radialOut, horizontalEnd]
+  const points = [rimPoint, radialOut, horizontalEnd]
       const lineGeometry = new THREE.BufferGeometry().setFromPoints(points)
       const lineMaterial = new THREE.LineBasicMaterial({ color: 0x0f172a, linewidth: 2 })
       const line = new THREE.Line(lineGeometry, lineMaterial)
       line.renderOrder = 999
-      group.add(line)
+  group.add(line)
+  // Add a small pulsing arrow at the horizontal end (initially hidden)
+  const arrowDir = new THREE.Vector3(Math.cos(midAngle), Math.sin(midAngle), 0).normalize()
+  const arrow = new THREE.ArrowHelper(arrowDir, horizontalEnd, 0.36, item.color, 0.08, 0.04)
+  arrow.visible = false
+  group.add(arrow)
 
       // Create DOM label
       const labelEl = document.createElement('div')
@@ -245,7 +266,7 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       container.appendChild(labelEl)
 
   // Save radialOut in local-space for future recomputation and the line to update
-  labelInfos.push({ el: labelEl, radialOutLocal: radialOut, line, endPoint: horizontalEnd, rimPointLocal: rimPoint, offset: horizontalOffset, side: toRight ? 'right' : 'left' })
+  labelInfos.push({ el: labelEl, radialOutLocal: radialOut, line, endPoint: horizontalEnd, rimPointLocal: rimPoint, offset: horizontalOffset, side: toRight ? 'right' : 'left', arrow })
 
       startAngle += sliceAngle
     })
@@ -278,6 +299,10 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
       }
 
       previousMouseRef.current = { x, y }
+      // update normalized mouse for raycasting (Three.js NDC)
+      const rect2 = containerRef.current!.getBoundingClientRect()
+      mouse.x = ((event.clientX - rect2.left) / rect2.width) * 2 - 1
+      mouse.y = -((event.clientY - rect2.top) / rect2.height) * 2 + 1
     }
 
     const onMouseDown = (event: MouseEvent) => {
@@ -323,9 +348,20 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         groupRef.current.rotation.z = rotationRef.current.z
       }
 
+      // check hover state (raycast based on mouse) so we can animate hovered slice
+      raycaster.setFromCamera(mouse, camera)
+      const intersects = raycaster.intersectObjects(meshes, true)
+      const hoveredIndex = intersects.length > 0 ? (intersects[0].object as any).userData.sliceIndex : -1
+      if (hoveredRef.index !== hoveredIndex) {
+        hoveredRef.index = hoveredIndex
+        labelInfos.forEach((li, idx) => {
+          if (li.arrow) li.arrow.visible = idx === hoveredIndex
+        })
+      }
+
       // update label positions by projecting 3D point into 2D
       const canvas = renderer.domElement
-      labelInfos.forEach((li) => {
+      labelInfos.forEach((li, i) => {
   // Lines are fixed with the pie in local coordinates so they rotate together.
   // We just need to project the local horizontal endpoint into screen space for label placement.
   const group = groupRef.current!
@@ -345,11 +381,29 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
           li.el.style.top = `${y}px`
           li.el.style.transform = 'translate(0%, -50%)'
           li.el.style.textAlign = 'left'
-        } else {
+  } else {
           li.el.style.left = `${x - 8}px`
           li.el.style.top = `${y}px`
           li.el.style.transform = 'translate(-100%, -50%)'
           li.el.style.textAlign = 'right'
+        }
+
+        // Hover animation: push the mesh a bit outward along its radial direction and pulse arrow
+        const mesh = meshes[i]
+        const radialDir = mesh?.userData?.radialDir as THREE.Vector3 | undefined
+        const isHover = hoveredRef.index === i
+        const targetPos = new THREE.Vector3(0, 0, 0)
+        if (isHover && radialDir) {
+          targetPos.copy(radialDir).multiplyScalar(0.15)
+        }
+        if (mesh) mesh.position.lerp(targetPos, 0.12)
+
+        if (li.arrow) {
+          if (li.arrow.visible) {
+            const pulse = 0.02 * Math.sin(Date.now() * 0.01 * 12)
+            const baseLen = 0.36
+            li.arrow.setLength(baseLen + pulse, 0.08 + pulse * 0.2, 0.04 + pulse * 0.4)
+          }
         }
       })
 
@@ -393,6 +447,10 @@ export default function PieChart3D({ completed, pending, autoClosed }: PieChart3
         // remove the THREE line if it's still attached
         if (groupRef.current && li.line && groupRef.current.children.includes(li.line)) {
           groupRef.current.remove(li.line)
+        }
+        // remove arrow if present
+        if (groupRef.current && li.arrow && groupRef.current.children.includes(li.arrow)) {
+          groupRef.current.remove(li.arrow)
         }
       })
     }
